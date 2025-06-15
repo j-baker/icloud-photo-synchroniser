@@ -1,0 +1,14 @@
+[package]
+name = "icloud-photo-synchroniser"
+version = "0.1.0"
+edition = "2024"
+license = "GPLv3"
+
+[dependencies]
+clap = { version = "4.5.40", features = ["derive"] }
+eyre = "0.6.12"
+rayon = "1.10.0"
+rusqlite = "0.36.0"
+sha2 = { version = "0.10.9", features = ["asm"] }
+tempfile = "3.20.0"
+walkdir = "2.5.0"
