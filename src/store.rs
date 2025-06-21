@@ -28,7 +28,7 @@ impl PhotoSyncStore {
         self.0.execute_batch(
             r#"
         CREATE TABLE IF NOT EXISTS old_target_files (
-        g    path    TEXT    NOT NULL,
+            path    TEXT    NOT NULL,
             mtime   INTEGER NOT NULL,
             size    INTEGER NOT NULL,
             digest  BLOB    NOT NULL,
