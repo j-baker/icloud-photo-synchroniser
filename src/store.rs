@@ -25,16 +25,10 @@ impl PhotoSyncStore {
     }
 
     pub fn ensure_schema(&mut self) -> Result<()> {
-        // One single `execute_batch` is slightly faster than three separate calls.
         self.0.execute_batch(
             r#"
-        PRAGMA foreign_keys = ON;          -- good practice, even if not used yet
-
-        /* ----------------------------------------------------------------- *
-         * Tables                                                            *
-         * ----------------------------------------------------------------- */
         CREATE TABLE IF NOT EXISTS old_target_files (
-            path    TEXT    NOT NULL,
+        g    path    TEXT    NOT NULL,
             mtime   INTEGER NOT NULL,
             size    INTEGER NOT NULL,
             digest  BLOB    NOT NULL,
