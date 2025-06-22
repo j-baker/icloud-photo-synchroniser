@@ -1,12 +1,22 @@
 use std::{
     path::{Path, PathBuf},
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use eyre::{ContextCompat, Result, eyre};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::digest::Sha256Hash;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WasTransferredFromSourceResult {
+    New,
+    Transferred,
+    NewMetadata {
+        last_modified: SystemTime,
+        size: u64,
+    },
+}
 
 pub struct PhotoSyncStore(Connection);
 
@@ -113,23 +123,30 @@ impl PhotoSyncStore {
         path: &Path,
         last_modified: SystemTime,
         size: u64,
-    ) -> Result<bool> {
+    ) -> Result<WasTransferredFromSourceResult> {
         let mut stmt = self.0.prepare_cached(
-            "SELECT 1 FROM source_files \
-             WHERE path=?1 AND mtime=?2 AND size=?3 LIMIT 1",
+            "SELECT mtime, size FROM source_files \
+             WHERE path=?1 LIMIT 1",
         )?;
-        let exists = stmt
-            .query_row(
-                params![
-                    path_to_text(path)?,
-                    system_time_as_i64(last_modified)?,
-                    size as i64
-                ],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        Ok(exists)
+        let last_modified = system_time_as_i64(last_modified)?;
+        let size = size as i64;
+        let data = stmt
+            .query_row(params![path_to_text(path)?], |r| {
+                Ok((r.get::<_, i64>("mtime")?, r.get::<_, i64>("size")?))
+            })
+            .optional()?;
+        Ok(if let Some((current_last_modified, current_size)) = data {
+            if current_last_modified == last_modified && current_size == size {
+                WasTransferredFromSourceResult::Transferred
+            } else {
+                WasTransferredFromSourceResult::NewMetadata {
+                    last_modified: i64_as_system_time(current_last_modified),
+                    size: current_size as u64,
+                }
+            }
+        } else {
+            WasTransferredFromSourceResult::New
+        })
     }
 
     pub fn mark_transferred_from_source(
@@ -159,6 +176,15 @@ fn system_time_as_i64(t: SystemTime) -> Result<i64> {
         .as_secs() as i64)
 }
 
+fn i64_as_system_time(t: i64) -> SystemTime {
+    let duration = Duration::from_secs(t.unsigned_abs());
+    if t >= 0 {
+        SystemTime::UNIX_EPOCH + duration
+    } else {
+        SystemTime::UNIX_EPOCH - duration
+    }
+}
+
 fn path_to_text(p: &Path) -> Result<String> {
     p.to_str()
         .map(|s| s.to_string())
@@ -185,7 +211,10 @@ mod tests {
 
         // Initially nothing exists.
         assert!(!store.exists_in_old_target(path, now, size).unwrap());
-        assert!(!store.was_transferred_from_source(path, now, size).unwrap());
+        assert_eq!(
+            store.was_transferred_from_source(path, now, size).unwrap(),
+            WasTransferredFromSourceResult::New
+        );
         assert!(!store.exists_in_target(&digest_a).unwrap());
 
         // Mark as already present in old target.
@@ -205,10 +234,11 @@ mod tests {
         store
             .mark_transferred_from_source(path, &digest_b, later, size2)
             .unwrap();
-        assert!(
+        assert_eq!(
             store
                 .was_transferred_from_source(path, later, size2)
-                .unwrap()
+                .unwrap(),
+            WasTransferredFromSourceResult::Transferred
         );
         assert!(store.exists_in_target(&digest_b).unwrap());
     }

@@ -17,7 +17,7 @@ use walkdir::WalkDir;
 
 use crate::{
     digest::{DigestWriter, digest},
-    store::PhotoSyncStore,
+    store::{PhotoSyncStore, WasTransferredFromSourceResult},
 };
 
 mod digest;
@@ -121,6 +121,7 @@ fn ensure_old_out_dir_properly_indexed(
 fn detect_new_files(store: &mut PhotoSyncStore, in_dir: &Path) -> Result<Vec<PathBuf>> {
     println!("starting phase 2: detecting new files");
     let mut result = Vec::new();
+    let mut failures = Vec::new();
     let mut total_processed = 0;
     for path in WalkDir::new(in_dir) {
         let path = path?;
@@ -131,8 +132,18 @@ fn detect_new_files(store: &mut PhotoSyncStore, in_dir: &Path) -> Result<Vec<Pat
         let last_modified = metadata.modified()?;
         let size = metadata.len();
         let path = path.path().strip_prefix(in_dir)?.to_path_buf();
-        if !store.was_transferred_from_source(&path, last_modified, size)? {
-            result.push(path);
+        match store.was_transferred_from_source(&path, last_modified, size)? {
+            WasTransferredFromSourceResult::New => result.push(path),
+            WasTransferredFromSourceResult::Transferred => {}
+            WasTransferredFromSourceResult::NewMetadata {
+                last_modified: old_last_modified,
+                size: old_size,
+            } => {
+                println!(
+                    "file {path:?} was already transferred but with a different size ({old_size} vs {size}) or last modified ({old_last_modified:?} vs {last_modified:?}). skipping for manual intervention."
+                );
+                failures.push(path);
+            }
         }
         total_processed += 1;
         if total_processed % 100 == 0 {
@@ -141,6 +152,10 @@ fn detect_new_files(store: &mut PhotoSyncStore, in_dir: &Path) -> Result<Vec<Pat
                 result.len()
             );
         }
+    }
+    println!("files for which metadata has changed between old and new:");
+    for path in failures {
+        println!("    {path:?}");
     }
     println!("finished phase 2: detecting new files");
     Ok(result)
@@ -157,9 +172,20 @@ fn transfer_new_files(
     let file_count = files.len();
     let mut bytes_stored = 0;
     let mut bytes_considered = 0;
+    let mut failed_paths: Vec<PathBuf> = Vec::new();
     for (idx, path) in files.iter().enumerate() {
         let in_path = in_dir.join(path);
-        let mut in_data = File::open(&in_path)?;
+        let in_data = File::open(&in_path);
+
+        // errors on first open are tolerated - the file is just skipped.
+        let mut in_data = match in_data {
+            Ok(f) => f,
+            Err(e) => {
+                println!("error when opening {in_path:?}. Skipping and moving on. {e}");
+                failed_paths.push(in_path);
+                continue;
+            }
+        };
 
         let file_metadata = fs::metadata(in_path)?;
         let size = file_metadata.len();
@@ -191,6 +217,11 @@ fn transfer_new_files(
                 bytes_considered / 1_000_000
             );
         }
+    }
+
+    println!("could not transfer the following files:");
+    for file in failed_paths {
+        println!("    {file:?}");
     }
 
     println!("finished phase 3: transferring new files");
