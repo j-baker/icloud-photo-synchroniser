@@ -17,10 +17,12 @@ use walkdir::WalkDir;
 
 use crate::{
     digest::{DigestWriter, digest},
+    sau64::SimpleAtomicU64,
     store::{PhotoSyncStore, WasTransferredFromSourceResult},
 };
 
 mod digest;
+mod sau64;
 mod store;
 
 #[derive(Parser, Debug)]
@@ -46,16 +48,18 @@ fn main() -> Result<()> {
 
     store.ensure_schema()?;
 
+    let store = store;
+
     println!("store successfully created");
 
     // first, we make sure that the old out directory has been properly indexed,
     // so all of its files have been hashed and recorded.
-    ensure_old_out_dir_properly_indexed(&mut store, &args.old_out_dir)?;
+    ensure_old_out_dir_properly_indexed(&store, &args.old_out_dir)?;
 
-    let new_files = detect_new_files(&mut store, &args.in_dir)?;
+    let new_files = detect_new_files(&store, &args.in_dir)?;
 
     transfer_new_files(
-        &mut store,
+        &store,
         &args.in_dir,
         &args.out_dir,
         &new_files,
@@ -65,10 +69,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn ensure_old_out_dir_properly_indexed(
-    store: &mut PhotoSyncStore,
-    old_out_dir: &Path,
-) -> Result<()> {
+fn ensure_old_out_dir_properly_indexed(store: &PhotoSyncStore, old_out_dir: &Path) -> Result<()> {
     println!("starting phase 1: ensuring old data hashed");
     let store = Mutex::new(store);
     let mut paths = Vec::new();
@@ -118,7 +119,7 @@ fn ensure_old_out_dir_properly_indexed(
     Ok(())
 }
 
-fn detect_new_files(store: &mut PhotoSyncStore, in_dir: &Path) -> Result<Vec<PathBuf>> {
+fn detect_new_files(store: &PhotoSyncStore, in_dir: &Path) -> Result<Vec<PathBuf>> {
     println!("starting phase 2: detecting new files");
     let mut result = Vec::new();
     let mut failures = Vec::new();
@@ -161,8 +162,14 @@ fn detect_new_files(store: &mut PhotoSyncStore, in_dir: &Path) -> Result<Vec<Pat
     Ok(result)
 }
 
+enum FileOutcome {
+    Success,
+    FailedToOpen(PathBuf),
+    FailedToCopy(PathBuf),
+}
+
 fn transfer_new_files(
-    store: &mut PhotoSyncStore,
+    store: &PhotoSyncStore,
     in_dir: &Path,
     out_dir: &Path,
     files: &[PathBuf],
@@ -170,10 +177,11 @@ fn transfer_new_files(
 ) -> Result<()> {
     println!("starting phase 3: transferring new files");
     let file_count = files.len();
-    let mut bytes_stored = 0;
-    let mut bytes_considered = 0;
-    let mut failed_paths: Vec<PathBuf> = Vec::new();
-    for (idx, path) in files.iter().enumerate() {
+    let files_considered = SimpleAtomicU64::default();
+    let bytes_stored = SimpleAtomicU64::default();
+    let bytes_considered = SimpleAtomicU64::default();
+
+    let results: Result<Vec<_>> = files.into_par_iter().map(|path| {
         let in_path = in_dir.join(path);
         let in_data = File::open(&in_path);
 
@@ -182,22 +190,22 @@ fn transfer_new_files(
             Ok(f) => f,
             Err(e) => {
                 println!("error when opening {in_path:?}. Skipping and moving on. {e}");
-                failed_paths.push(in_path);
-                continue;
+                return Ok(FileOutcome::FailedToOpen(in_path));
             }
         };
 
-        let file_metadata = fs::metadata(in_path)?;
+        let file_metadata = fs::metadata(&in_path)?;
         let size = file_metadata.len();
-        bytes_considered += size;
+        bytes_considered.fetch_add(size);
 
         let mut temp_path = NamedTempFile::new_in(temp_dir)?;
         let out_path = out_dir.join(path);
 
         let mut writer = DigestWriter::new(temp_path.as_file_mut());
         let maybe_err = io::copy(&mut in_data, &mut writer);
-        if maybe_err.is_err() {
-            continue;
+        if let Err(e) = maybe_err {
+            println!("failed to copy bytes of file {in_path:?}: {e}");
+            return Ok(FileOutcome::FailedToCopy(in_path));
         }
 
         let digest = writer.finalise()?;
@@ -206,23 +214,32 @@ fn transfer_new_files(
 
         if !already_exists {
             temp_path.persist_noclobber(out_path)?;
-            bytes_stored += size;
+            bytes_stored.fetch_add(size);
         }
         store.mark_transferred_from_source(path, &digest, file_metadata.modified()?, size)?;
 
-        if idx % 10 == 0 {
+        let files_considered = files_considered.fetch_add(1);
+
+        if files_considered % 10 == 0 {
             println!(
-                "processed {idx} files overall of {file_count}, added {}MB of {}MB considered",
-                bytes_stored / 1_000_000,
-                bytes_considered / 1_000_000
+                "processed {files_considered} files overall of {file_count}, added {}MB of {}MB considered",
+                bytes_stored.as_u64() / 1_000_000,
+                bytes_considered.as_u64() / 1_000_000
             );
         }
-    }
+        Ok(FileOutcome::Success)
+    }).collect();
+    let results = results?;
 
     println!("could not transfer the following files:");
-    for file in failed_paths {
-        println!("    {file:?}");
-    }
+    results
+        .into_iter()
+        .filter_map(|x| match x {
+            FileOutcome::Success => None,
+            FileOutcome::FailedToOpen(path_buf) => Some(path_buf),
+            FileOutcome::FailedToCopy(path_buf) => Some(path_buf),
+        })
+        .for_each(|path| println!("    {path:?}"));
 
     println!("finished phase 3: transferring new files");
 

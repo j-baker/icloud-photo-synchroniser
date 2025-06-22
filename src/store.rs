@@ -1,5 +1,6 @@
 use std::{
     path::{Path, PathBuf},
+    sync::{Mutex, MutexGuard},
     time::{Duration, SystemTime},
 };
 
@@ -18,24 +19,30 @@ pub enum WasTransferredFromSourceResult {
     },
 }
 
-pub struct PhotoSyncStore(Connection);
+pub struct PhotoSyncStore(Mutex<Connection>);
 
 impl PhotoSyncStore {
     #[cfg(test)]
     pub fn new_for_tests() -> Result<Self> {
-        let mut store = Self(Connection::open_in_memory()?);
+        let mut store = Self(Mutex::new(Connection::open_in_memory()?));
         store.ensure_schema()?;
         Ok(store)
     }
 
     pub fn new(path: PathBuf) -> Result<Self> {
-        let mut store = Self(Connection::open(path)?);
+        let mut store = Self(Mutex::new(Connection::open(path)?));
         store.ensure_schema()?;
         Ok(store)
     }
 
+    fn acquire_connection(&self) -> MutexGuard<Connection> {
+        self.0.lock().expect("no panicking here")
+    }
+
+    // technically doesn't need &mut but helps to promote safety
     pub fn ensure_schema(&mut self) -> Result<()> {
-        self.0.execute_batch(
+        let conn = self.acquire_connection();
+        conn.execute_batch(
             r#"
         CREATE TABLE IF NOT EXISTS old_target_files (
             path    TEXT    NOT NULL,
@@ -64,12 +71,13 @@ impl PhotoSyncStore {
     }
 
     pub fn exists_in_old_target(
-        &mut self,
+        &self,
         path: &Path,
         last_modified: SystemTime,
         size: u64,
     ) -> Result<bool> {
-        let mut stmt = self.0.prepare_cached(
+        let conn = self.acquire_connection();
+        let mut stmt = conn.prepare_cached(
             "SELECT 1 FROM old_target_files \
              WHERE path=?1 AND mtime=?2 AND size=?3 LIMIT 1",
         )?;
@@ -88,13 +96,13 @@ impl PhotoSyncStore {
     }
 
     pub fn mark_exists_in_old_target(
-        &mut self,
+        &self,
         path: &Path,
         last_modified: SystemTime,
         size: u64,
         digest: &Sha256Hash,
     ) -> Result<()> {
-        self.0.execute(
+        self.acquire_connection().execute(
             "INSERT INTO old_target_files (path, mtime, size, digest)
              VALUES (?1, ?2, ?3, ?4)",
             params![
@@ -107,10 +115,10 @@ impl PhotoSyncStore {
         Ok(())
     }
 
-    pub fn exists_in_target(&mut self, digest: &Sha256Hash) -> Result<bool> {
-        let mut stmt = self
-            .0
-            .prepare_cached("SELECT 1 FROM all_target_digests WHERE digest=?1 LIMIT 1")?;
+    pub fn exists_in_target(&self, digest: &Sha256Hash) -> Result<bool> {
+        let conn = self.acquire_connection();
+        let mut stmt =
+            conn.prepare_cached("SELECT 1 FROM all_target_digests WHERE digest=?1 LIMIT 1")?;
         let exists = stmt
             .query_row(params![digest], |_| Ok(()))
             .optional()?
@@ -119,12 +127,13 @@ impl PhotoSyncStore {
     }
 
     pub fn was_transferred_from_source(
-        &mut self,
+        &self,
         path: &Path,
         last_modified: SystemTime,
         size: u64,
     ) -> Result<WasTransferredFromSourceResult> {
-        let mut stmt = self.0.prepare_cached(
+        let conn = self.acquire_connection();
+        let mut stmt = conn.prepare_cached(
             "SELECT mtime, size FROM source_files \
              WHERE path=?1 LIMIT 1",
         )?;
@@ -150,13 +159,13 @@ impl PhotoSyncStore {
     }
 
     pub fn mark_transferred_from_source(
-        &mut self,
+        &self,
         path: &Path,
         digest: &Sha256Hash,
         last_modified: SystemTime,
         size: u64,
     ) -> Result<()> {
-        self.0.execute(
+        self.acquire_connection().execute(
             "INSERT INTO source_files (path, mtime, size, digest)
              VALUES (?1, ?2, ?3, ?4)",
             params![
@@ -202,7 +211,7 @@ mod tests {
 
     #[test]
     fn full_roundtrip() {
-        let mut store = PhotoSyncStore::new_for_tests().unwrap();
+        let store = PhotoSyncStore::new_for_tests().unwrap();
 
         let path = Path::new("/tmp/foo.jpg");
         let size = 1234u64;
