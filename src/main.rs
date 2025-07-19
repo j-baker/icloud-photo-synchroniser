@@ -12,6 +12,7 @@ use std::{
 use clap::Parser;
 use eyre::Result;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use std::os::unix::fs::PermissionsExt;
 use tempfile::NamedTempFile;
 use walkdir::WalkDir;
 
@@ -213,9 +214,11 @@ fn transfer_new_files(
         let already_exists = store.exists_in_target(&digest)?;
 
         if !already_exists {
-            temp_path.persist_noclobber(out_path)?;
+            temp_path.persist_noclobber(&out_path)?;
             bytes_stored.fetch_add(size);
+            fs::set_permissions(out_path, fs::Permissions::from_mode(0o644))?;
         }
+
         store.mark_transferred_from_source(path, &digest, file_metadata.modified()?, size)?;
 
         let files_considered = files_considered.fetch_add(1);
