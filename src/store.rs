@@ -16,6 +16,7 @@ pub enum WasTransferredFromSourceResult {
     NewMetadata {
         last_modified: SystemTime,
         size: u64,
+        digest: Sha256Hash,
     },
 }
 
@@ -75,24 +76,30 @@ impl PhotoSyncStore {
         path: &Path,
         last_modified: SystemTime,
         size: u64,
-    ) -> Result<bool> {
+    ) -> Result<WasTransferredFromSourceResult> {
         let conn = self.acquire_connection();
         let mut stmt = conn.prepare_cached(
-            "SELECT 1 FROM old_target_files \
-             WHERE path=?1 AND mtime=?2 AND size=?3 LIMIT 1",
+            "SELECT mtime, size, digest FROM old_target_files \
+             WHERE path=?1 LIMIT 1",
         )?;
-        let exists = stmt
-            .query_row(
-                params![
-                    path_to_text(path)?,
-                    system_time_as_i64(last_modified)?,
-                    size as i64
-                ],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        Ok(exists)
+        let row = stmt
+            .query_row(params![path_to_text(path)?,], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()?;
+        let Some((mtime, current_size, digest)) = row else {
+            return Ok(WasTransferredFromSourceResult::New);
+        };
+
+        if mtime != system_time_as_i64(last_modified)? || size as i64 != current_size {
+            return Ok(WasTransferredFromSourceResult::NewMetadata {
+                last_modified: i64_as_system_time(mtime),
+                size: current_size as u64,
+                digest,
+            });
+        }
+
+        Ok(WasTransferredFromSourceResult::Transferred)
     }
 
     pub fn mark_exists_in_old_target(
@@ -103,7 +110,7 @@ impl PhotoSyncStore {
         digest: &Sha256Hash,
     ) -> Result<()> {
         self.acquire_connection().execute(
-            "INSERT INTO old_target_files (path, mtime, size, digest)
+            "INSERT OR REPLACE INTO old_target_files (path, mtime, size, digest)
              VALUES (?1, ?2, ?3, ?4)",
             params![
                 path_to_text(path)?,
@@ -134,28 +141,35 @@ impl PhotoSyncStore {
     ) -> Result<WasTransferredFromSourceResult> {
         let conn = self.acquire_connection();
         let mut stmt = conn.prepare_cached(
-            "SELECT mtime, size FROM source_files \
+            "SELECT mtime, size, digest FROM source_files \
              WHERE path=?1 LIMIT 1",
         )?;
         let last_modified = system_time_as_i64(last_modified)?;
         let size = size as i64;
         let data = stmt
             .query_row(params![path_to_text(path)?], |r| {
-                Ok((r.get::<_, i64>("mtime")?, r.get::<_, i64>("size")?))
+                Ok((
+                    r.get::<_, i64>("mtime")?,
+                    r.get::<_, i64>("size")?,
+                    r.get::<_, Sha256Hash>("digest")?,
+                ))
             })
             .optional()?;
-        Ok(if let Some((current_last_modified, current_size)) = data {
-            if current_last_modified == last_modified && current_size == size {
-                WasTransferredFromSourceResult::Transferred
-            } else {
-                WasTransferredFromSourceResult::NewMetadata {
-                    last_modified: i64_as_system_time(current_last_modified),
-                    size: current_size as u64,
+        Ok(
+            if let Some((current_last_modified, current_size, digest)) = data {
+                if current_last_modified == last_modified && current_size == size {
+                    WasTransferredFromSourceResult::Transferred
+                } else {
+                    WasTransferredFromSourceResult::NewMetadata {
+                        last_modified: i64_as_system_time(current_last_modified),
+                        size: current_size as u64,
+                        digest,
+                    }
                 }
-            }
-        } else {
-            WasTransferredFromSourceResult::New
-        })
+            } else {
+                WasTransferredFromSourceResult::New
+            },
+        )
     }
 
     pub fn mark_transferred_from_source(
@@ -219,7 +233,10 @@ mod tests {
         let digest_a = dummy_digest(1);
 
         // Initially nothing exists.
-        assert!(!store.exists_in_old_target(path, now, size).unwrap());
+        assert!(matches!(
+            store.exists_in_old_target(path, now, size).unwrap(),
+            WasTransferredFromSourceResult::New
+        ));
         assert_eq!(
             store.was_transferred_from_source(path, now, size).unwrap(),
             WasTransferredFromSourceResult::New
@@ -230,7 +247,10 @@ mod tests {
         store
             .mark_exists_in_old_target(path, now, size, &digest_a)
             .unwrap();
-        assert!(store.exists_in_old_target(path, now, size).unwrap());
+        assert!(matches!(
+            store.exists_in_old_target(path, now, size).unwrap(),
+            WasTransferredFromSourceResult::Transferred
+        ));
         assert!(store.exists_in_target(&digest_a).unwrap());
 
         // Different digest not yet present
