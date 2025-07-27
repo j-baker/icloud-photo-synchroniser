@@ -101,11 +101,12 @@ fn ensure_old_out_dir_properly_indexed(store: &PhotoSyncStore, old_out_dir: &Pat
         let last_modified = metadata.modified()?;
         let size = metadata.size();
 
-        match store.lock().unwrap().exists_in_old_target(
+        let exists_in_old_target = store.lock().unwrap().exists_in_old_target(
             &path,
             metadata.modified()?,
             metadata.size(),
-        )? {
+        )?;
+        match exists_in_old_target {
             WasTransferredFromSourceResult::New => {
                 let digest = digest(&full_path)?;
                 bytes_processed.fetch_add(size, Ordering::SeqCst);
