@@ -5,7 +5,7 @@ use std::{
     path::Path,
 };
 
-use rusqlite::ToSql;
+use rusqlite::{ToSql, types::FromSql};
 use sha2::{Digest, Sha256};
 
 const SHA256_BYTES: usize = 32;
@@ -23,6 +23,12 @@ impl Sha256Hash {
 impl ToSql for Sha256Hash {
     fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
         self.0.to_sql()
+    }
+}
+
+impl FromSql for Sha256Hash {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        Ok(Self(FromSql::column_result(value)?))
     }
 }
 

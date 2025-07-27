@@ -10,7 +10,7 @@ use std::{
 };
 
 use clap::Parser;
-use eyre::Result;
+use eyre::{Result, ensure};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::os::unix::fs::PermissionsExt;
 use tempfile::NamedTempFile;
@@ -100,17 +100,41 @@ fn ensure_old_out_dir_properly_indexed(store: &PhotoSyncStore, old_out_dir: &Pat
         let metadata = fs::metadata(&full_path)?;
         let last_modified = metadata.modified()?;
         let size = metadata.size();
-        if !store.lock().unwrap().exists_in_old_target(
+
+        match store.lock().unwrap().exists_in_old_target(
             &path,
             metadata.modified()?,
             metadata.size(),
         )? {
-            let digest = digest(&full_path)?;
-            bytes_processed.fetch_add(size, Ordering::SeqCst);
-            store
-                .lock()
-                .unwrap()
-                .mark_exists_in_old_target(&path, last_modified, size, &digest)?;
+            WasTransferredFromSourceResult::New => {
+                let digest = digest(&full_path)?;
+                bytes_processed.fetch_add(size, Ordering::SeqCst);
+                store.lock().unwrap().mark_exists_in_old_target(
+                    &path,
+                    last_modified,
+                    size,
+                    &digest,
+                )?;
+            }
+            WasTransferredFromSourceResult::Transferred => {}
+            WasTransferredFromSourceResult::NewMetadata {
+                last_modified,
+                size,
+                digest: old_digest,
+            } => {
+                let new_digest = digest(&full_path)?;
+                ensure!(
+                    old_digest == new_digest,
+                    "unexpected rewrite of file {full_path:?}, digest changed"
+                );
+                bytes_processed.fetch_add(size, Ordering::SeqCst);
+                store.lock().unwrap().mark_exists_in_old_target(
+                    &path,
+                    last_modified,
+                    size,
+                    &new_digest,
+                )?;
+            }
         }
 
         Ok::<_, eyre::Error>(())
@@ -140,6 +164,7 @@ fn detect_new_files(store: &PhotoSyncStore, in_dir: &Path) -> Result<Vec<PathBuf
             WasTransferredFromSourceResult::NewMetadata {
                 last_modified: old_last_modified,
                 size: old_size,
+                ..
             } => {
                 println!(
                     "file {path:?} was already transferred but with a different size ({old_size} vs {size}) or last modified ({old_last_modified:?} vs {last_modified:?}). skipping for manual intervention."
